@@ -1,4 +1,4 @@
-module github.com/glitchruk/webgrab
+module github.com/aljoni/webgrab
 
 go 1.21.5
 

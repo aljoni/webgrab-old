@@ -11,7 +11,7 @@ WebGrab is a simple Go library which allows for easy scraping of web pages. It i
 ## Installation
 
 ```bash
-go get github.com/glitchruk/webgrab
+go get github.com/aljoni/webgrab
 ```
 
 ## Usage
@@ -22,7 +22,7 @@ package main
 import (
     "fmt"
 
-    "github.com/glitchruk/webgrab"
+    "github.com/aljoni/webgrab"
 )
 
 type Page struct {
