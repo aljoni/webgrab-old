@@ -1,6 +1,7 @@
 package webgrab
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -11,303 +12,193 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
-// TagName is the name of the tag that contains the data to grab.
-const tagNameGrab = "grab"
+// Tag names for struct fields.
+const (
+	tagNameGrab      = "grab"
+	tagNameExtract   = "extract"
+	tagNameFilter    = "filter"
+	tagNameAttribute = "attr"
+)
 
-// TagNameExtract is the name of the tag that contains the regex to use for
-// extracting a part of the value.
-const tagNameExtract = "extract"
-
-// TagNameFilter is the name of the tag that contains the regex to use for
-// filtering the value.
-const tagNameFilter = "filter"
-
-// TagNameAttribute is the name of the tag that contains the attribute of the
-// tag to grab.
-const tagNameAttribute = "attr"
-
-// Grabber is the struct that contains the configuration for the grabber.
+// Grabber configures and performs web scraping.
 type Grabber struct {
-	// Timeout is the timeout in seconds for the grabber.
-	Timeout int
-
-	// MaxRedirects is the maximum number of redirects to follow.
+	Timeout      int
 	MaxRedirects int
-
-	// UserAgent is the user agent to use for the grabber.
-	UserAgent string
+	UserAgent    string
 }
 
+// grabTag represents a single tag for scraping.
 type grabTag struct {
-	// Field is the name of the field in the struct.
-	Field string
-
-	// FieldType is the type of the field in the struct.
+	Field     string
 	FieldType reflect.Type
-
-	// Selector is the CSS selector for the tag.
-	Selector string
-
-	// Attribute is the attribute of the tag to grab.
+	Selector  string
 	Attribute string
-
-	// Extract is the regex to use for the grabber.
-	Extract string
-
-	// Filter is the regex to use for filtering the value.
-	Filter string
+	Extract   string
+	Filter    string
 }
 
-// parseStruct parses the given struct and returns a slice of grab tags.
+// parseStruct parses struct tags for scraping.
 func parseStruct(data any) []grabTag {
-	// Create a new slice of grab tags.
-	tags := make([]grabTag, 0)
-
-	// For each field in the data struct, find the corresponding tag in the
-	// document and set the value of the field to the text of the tag.
-	for i := 0; i < reflect.TypeOf(data).Elem().NumField(); i++ {
-		// Get the tag.
-		tag := grabTag{
-			Field:     reflect.TypeOf(data).Elem().Field(i).Name,
-			FieldType: reflect.TypeOf(data).Elem().Field(i).Type,
-			Selector:  reflect.TypeOf(data).Elem().Field(i).Tag.Get(tagNameGrab),
-			Extract:   reflect.TypeOf(data).Elem().Field(i).Tag.Get(tagNameExtract),
-			Filter:    reflect.TypeOf(data).Elem().Field(i).Tag.Get(tagNameFilter),
-			Attribute: reflect.TypeOf(data).Elem().Field(i).Tag.Get(tagNameAttribute),
-		}
-
-		// Append the tag to the slice.
-		tags = append(tags, tag)
+	t := reflect.TypeOf(data).Elem()
+	var tags []grabTag
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		tags = append(tags, grabTag{
+			Field:     field.Name,
+			FieldType: field.Type,
+			Selector:  field.Tag.Get(tagNameGrab),
+			Extract:   field.Tag.Get(tagNameExtract),
+			Filter:    field.Tag.Get(tagNameFilter),
+			Attribute: field.Tag.Get(tagNameAttribute),
+		})
 	}
-
-	// Return the tags.
 	return tags
 }
 
-// Grab grabs the data from the given URL and stores it in the given data
-// struct.
+// Grab fetches and populates data from a URL into the provided struct pointer.
 func (g Grabber) Grab(url string, data any) error {
-	// If the data is not a pointer, return an error.
 	if reflect.TypeOf(data).Kind() != reflect.Ptr {
 		return fmt.Errorf("data must be a pointer")
 	}
-
-	// Create a new HTTP client with the given timeout.
 	client := &http.Client{
 		Timeout: time.Second * time.Duration(g.Timeout),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// If the number of redirects is greater than the maximum number of
-			// redirects, return an error.
 			if len(via) >= g.MaxRedirects {
 				return http.ErrUseLastResponse
 			}
-
-			// Otherwise, return nil.
 			return nil
 		},
 	}
-
-	// Create a new request with the given URL.
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
-
-	// Set the user agent header.
 	req.Header.Set("User-Agent", g.UserAgent)
-
-	// Create a new response.
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	// If the status code is not 200, return an error.
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("status code is not 200: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
-
-	// Create a new document from the response body.
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return err
 	}
-
-	// Perform the scrape.
-	err = g.scrapeStruct(doc, data)
-	if err != nil {
-		return err
-	}
-
-	// Return nil.
-	return nil
+	return g.scrapeStruct(doc, data)
 }
 
-func (g Grabber) filter(str string, regex string) bool {
-	// Compile the regex.
-	re := regexp.MustCompile(regex)
-
-	// Return whether the string matches the regex.
+// filter checks if a string matches a regex pattern.
+func (g Grabber) filter(str, regex string) bool {
+	re, err := regexp.Compile(regex)
+	if err != nil {
+		return false
+	}
 	return re.MatchString(str)
 }
 
-// extract extracts the first matched group from the given string using the
-// given regex.
-func (g Grabber) extract(str string, regex string) string {
-	// Compile the regex.
-	re := regexp.MustCompile(regex)
-
-	// Find the first match.
+// extract extracts a substring matching a regex pattern.
+func (g Grabber) extract(str, regex string) string {
+	re, err := regexp.Compile(regex)
+	if err != nil {
+		return "(invalid regex)"
+	}
 	match := re.FindStringSubmatch(str)
-
-	// If there is no match, return an empty string.
-	if len(match) == 0 {
+	if len(match) < 2 {
 		return "(no match)"
 	}
-
-	// Return the first matched group.
 	return match[1]
 }
 
+// clean removes unwanted whitespace and extracts substrings from the scraped text.
 func (g Grabber) clean(str string, tag grabTag) string {
-	// If the regex is empty, return the string.
 	if tag.Extract != "" {
-		// Extract the part of the value specified by the regex.
 		str = g.extract(str, tag.Extract)
 	}
-
-	// Return the trimmed string.
 	return strings.TrimSpace(str)
 }
 
+// scrape performs the actual scraping for a single tag.
 func (g Grabber) scrape(doc *goquery.Document, tag grabTag) (string, error) {
-	// Find the tag in the document.
 	sel := doc.Find(tag.Selector)
-
-	// If the tag was not found, return an error.
 	if sel.Length() == 0 {
 		return "", fmt.Errorf("tag not found: %s", tag.Selector)
 	}
-
-	// If tag was found more than once, use the first tag.
-	if sel.Length() > 1 {
-		sel = sel.First()
-	}
-
-	// If the filter is not empty, filter the value.
-	if tag.Filter != "" {
-		// If the value does not match the filter, return an error.
-		if !g.filter(sel.Text(), tag.Filter) {
-			return "", fmt.Errorf("tag does not match filter: %s", tag.Filter)
-		}
-	}
-
-	// If the attribute is empty, return the trimmed text of the tag.
+	sel = sel.First()
+	val := ""
 	if tag.Attribute == "" {
-		return g.clean(sel.Text(), tag), nil
+		val = sel.Text()
+	} else {
+		val = sel.AttrOr(tag.Attribute, "")
 	}
-
-	// Return the attribute.
-	return g.clean(sel.AttrOr(tag.Attribute, ""), tag), nil
+	if tag.Filter != "" && !g.filter(val, tag.Filter) {
+		return "", fmt.Errorf("tag does not match filter: %s", tag.Filter)
+	}
+	return g.clean(val, tag), nil
 }
 
+// scrapeSlice performs the actual scraping for a slice of tags.
 func (g Grabber) scrapeSlice(doc *goquery.Document, tag grabTag) ([]string, error) {
-	// Create a new slice of strings.
-	strs := make([]string, 0)
-
-	// Find the tags in the document.
+	var strs []string
 	sel := doc.Find(tag.Selector)
-
-	// If the tag was not found, return an error.
 	if sel.Length() == 0 {
 		return nil, fmt.Errorf("tag not found: %s", tag.Selector)
 	}
-
-	// For each tag, append the text of the tag to the slice.
 	sel.Each(func(i int, s *goquery.Selection) {
-		// If the attribute is empty, append the text of the tag.
+		val := ""
 		if tag.Attribute == "" {
-			// If the filter is not empty, filter the value.
-			if tag.Filter != "" {
-				// If the value does not match the filter, return.
-				if !g.filter(s.Text(), tag.Filter) {
-					return
-				}
-			}
-
-			// Append the text of the tag.
-			strs = append(strs, g.clean(s.Text(), tag))
+			val = s.Text()
+		} else {
+			val = s.AttrOr(tag.Attribute, "")
+		}
+		if tag.Filter != "" && !g.filter(val, tag.Filter) {
 			return
 		}
-
-		// If the filter is not empty, filter the value.
-		if tag.Filter != "" {
-			// If the value does not match the filter, return.
-			if !g.filter(s.AttrOr(tag.Attribute, ""), tag.Filter) {
-				return
-			}
-		}
-
-		// Append the attribute.
-		strs = append(strs, g.clean(s.AttrOr(tag.Attribute, ""), tag))
+		strs = append(strs, g.clean(val, tag))
 	})
-
-	// Return the slice.
 	return strs, nil
 }
 
+// scrapeStruct performs the actual scraping for a nested struct.
 func (g Grabber) scrapeStruct(doc *goquery.Document, nested any) error {
-	// Parse the struct.
 	tags := parseStruct(nested)
-
-	// For each tag, find the corresponding tag in the document and set the
-	// value of the field to the text of the tag.
+	var errs []error
+	val := reflect.ValueOf(nested).Elem()
 	for _, tag := range tags {
-		// If the field is a struct, scrape the struct.
-		if tag.FieldType.Kind() == reflect.Struct {
-			g.scrapeStruct(doc, reflect.ValueOf(nested).Elem().FieldByName(tag.Field).Addr().Interface())
-			continue
-		}
-
-		// If the field is a slice, scrape the slice.
-		if tag.FieldType.Kind() == reflect.Slice {
+		field := val.FieldByName(tag.Field)
+		switch tag.FieldType.Kind() {
+		case reflect.Struct:
+			if err := g.scrapeStruct(doc, field.Addr().Interface()); err != nil {
+				errs = append(errs, err)
+			}
+		case reflect.Slice:
 			strings, err := g.scrapeSlice(doc, tag)
 			if err != nil {
+				errs = append(errs, err)
 				continue
 			}
-
-			// Create a new slice.
 			slice := reflect.MakeSlice(tag.FieldType, len(strings), len(strings))
-
-			// For each string, set the value of the slice to the string.
 			for i, str := range strings {
 				slice.Index(i).SetString(str)
 			}
-
-			// Set the value of the field to the slice.
-			reflect.ValueOf(nested).Elem().FieldByName(tag.Field).Set(slice)
-			continue
-		}
-
-		// If the field is a string, scrape the string.
-		if tag.FieldType.Kind() == reflect.String {
+			field.Set(slice)
+		case reflect.String:
 			str, err := g.scrape(doc, tag)
 			if err != nil {
+				errs = append(errs, err)
 				continue
 			}
-
-			// Set the value of the field to the string.
-			reflect.ValueOf(nested).Elem().FieldByName(tag.Field).SetString(str)
-			continue
+			field.SetString(str)
 		}
 	}
-
-	// Return nil.
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }
 
-// New returns a new Grab struct with default values.
+// New returns a new Grabber with default values.
 func New() *Grabber {
 	return &Grabber{
 		Timeout:      10,
