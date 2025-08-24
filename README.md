@@ -53,10 +53,13 @@ The defined tags are:
 * `attr:"attribute"` - The attribute of the selected element to grab.
 * `extract:"regexp"` - A regular expression to extract a value from a string.
 * `filter:"regexp"` - A regular expression to filter the value of a field.
+* `context:"selector"` - Restricts the context for a nested struct or slice of structs.
 
 The selector is a [GoQuery](http://godoc.org/github.com/PuerkitoBio/goquery) selector. The attribute is an
 optional attribute of the selected element to grab. If no attribute is
 specified, the text of the selected element will be grabbed.
+
+---
 
 ### Arrays
 
@@ -69,20 +72,42 @@ type Page struct {
 }
 ```
 
-### Nested Structs
+---
 
-It is possible to use nested structs to grab values from the page. For example,
-to grab the title and meta keywords from a page:
+### Nested Structs and Context Windows
+
+You can use nested structs to grab values from a specific section of the page.  
+With the new `context` tag, you can restrict the scraping context for a struct or a slice of structs.
+
+#### Single Nested Struct with Context
 
 ```go
+type Profile struct {
+    Name  string `grab:".name"`
+    Email string `grab:".email"`
+}
+
 type Page struct {
-    Title string `grab:"title"`
-    Meta  struct {
-        Keywords string `grab:"meta[name=keywords]" attr:"content"`
-        Author   string `grab:"meta[name=author]" attr:"content"`
-    }
+    Profile Profile `context:".profile-section"`
 }
 ```
+This will only search for `.name` and `.email` inside the first `.profile-section` element.
+
+#### Slice of Structs with Context
+
+```go
+type Item struct {
+    Title string `grab:".title"`
+    Link  string `grab:"a" attr:"href"`
+}
+
+type Page struct {
+    Items []Item `context:".item"`
+}
+```
+This will find all elements matching `.item`, and for each, scrape the `.title` and the first `<a>`'s `href` inside that `.item`.
+
+---
 
 ### Extract
 
@@ -95,6 +120,8 @@ type Page struct {
 }
 ```
 
+---
+
 ### Filter
 
 The `filter` tag can be used to filter the value of a field. For example, to
@@ -102,6 +129,6 @@ get all links that end with `.html`:
 
 ```go
 type Page struct {
-    Links []string `grab:"a[href]" attr:"href" filter:".*\.html$"`
+    Links []string `grab:"a[href]" attr:"href" filter:".*\\.html$"`
 }
 ```

@@ -18,6 +18,7 @@ const (
 	tagNameExtract   = "extract"
 	tagNameFilter    = "filter"
 	tagNameAttribute = "attr"
+	tagNameContext   = "context"
 )
 
 // Grabber configures and performs web scraping.
@@ -35,6 +36,7 @@ type grabTag struct {
 	Attribute string
 	Extract   string
 	Filter    string
+	Context   string
 }
 
 // parseStruct parses struct tags for scraping.
@@ -50,6 +52,7 @@ func parseStruct(data any) []grabTag {
 			Extract:   field.Tag.Get(tagNameExtract),
 			Filter:    field.Tag.Get(tagNameFilter),
 			Attribute: field.Tag.Get(tagNameAttribute),
+			Context:   field.Tag.Get(tagNameContext),
 		})
 	}
 	return tags
@@ -169,20 +172,55 @@ func (g Grabber) scrapeStruct(doc *goquery.Document, nested any) error {
 		field := val.FieldByName(tag.Field)
 		switch tag.FieldType.Kind() {
 		case reflect.Struct:
-			if err := g.scrapeStruct(doc, field.Addr().Interface()); err != nil {
+			// If context is set, restrict doc to that selection
+			subDoc := doc
+			if tag.Context != "" {
+				sel := doc.Find(tag.Context)
+				if sel.Length() == 0 {
+					errs = append(errs, fmt.Errorf("context not found: %s", tag.Context))
+					continue
+				}
+				node := sel.First().Nodes[0]
+				subDoc = goquery.NewDocumentFromNode(node)
+			}
+			if err := g.scrapeStruct(subDoc, field.Addr().Interface()); err != nil {
 				errs = append(errs, err)
 			}
 		case reflect.Slice:
-			strings, err := g.scrapeSlice(doc, tag)
-			if err != nil {
-				errs = append(errs, err)
-				continue
+			elemType := tag.FieldType.Elem()
+			if elemType.Kind() == reflect.Struct {
+				// Slices of structs: context tag is required
+				contextSelector := tag.Context
+				if contextSelector == "" {
+					errs = append(errs, fmt.Errorf("slice of structs requires 'context' tag on field %s", tag.Field))
+					continue
+				}
+				sel := doc.Find(contextSelector)
+				if sel.Length() == 0 {
+					errs = append(errs, fmt.Errorf("context not found: %s", contextSelector))
+					continue
+				}
+				slice := reflect.MakeSlice(tag.FieldType, 0, sel.Length())
+				sel.Each(func(i int, s *goquery.Selection) {
+					elemPtr := reflect.New(elemType)
+					subDoc := goquery.NewDocumentFromNode(s.Nodes[0])
+					if err := g.scrapeStruct(subDoc, elemPtr.Interface()); err == nil {
+						slice = reflect.Append(slice, elemPtr.Elem())
+					}
+				})
+				field.Set(slice)
+			} else if elemType.Kind() == reflect.String {
+				strings, err := g.scrapeSlice(doc, tag)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				slice := reflect.MakeSlice(tag.FieldType, len(strings), len(strings))
+				for i, str := range strings {
+					slice.Index(i).SetString(str)
+				}
+				field.Set(slice)
 			}
-			slice := reflect.MakeSlice(tag.FieldType, len(strings), len(strings))
-			for i, str := range strings {
-				slice.Index(i).SetString(str)
-			}
-			field.Set(slice)
 		case reflect.String:
 			str, err := g.scrape(doc, tag)
 			if err != nil {
