@@ -1,10 +1,10 @@
 module github.com/aljoni/webgrab
 
-go 1.21.5
+go 1.23.0
 
-require github.com/PuerkitoBio/goquery v1.8.1
+require github.com/PuerkitoBio/goquery v1.10.3
 
 require (
-	github.com/andybalholm/cascadia v1.3.1 // indirect
-	golang.org/x/net v0.7.0 // indirect
+	github.com/andybalholm/cascadia v1.3.3 // indirect
+	golang.org/x/net v0.39.0 // indirect
 )

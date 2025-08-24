@@ -59,7 +59,7 @@ type grabTag struct {
 }
 
 // parseStruct parses the given struct and returns a slice of grab tags.
-func parseStruct(data interface{}) []grabTag {
+func parseStruct(data any) []grabTag {
 	// Create a new slice of grab tags.
 	tags := make([]grabTag, 0)
 
@@ -86,7 +86,7 @@ func parseStruct(data interface{}) []grabTag {
 
 // Grab grabs the data from the given URL and stores it in the given data
 // struct.
-func (g Grabber) Grab(url string, data interface{}) error {
+func (g Grabber) Grab(url string, data any) error {
 	// If the data is not a pointer, return an error.
 	if reflect.TypeOf(data).Kind() != reflect.Ptr {
 		return fmt.Errorf("data must be a pointer")
@@ -257,7 +257,7 @@ func (g Grabber) scrapeSlice(doc *goquery.Document, tag grabTag) ([]string, erro
 	return strs, nil
 }
 
-func (g Grabber) scrapeStruct(doc *goquery.Document, nested interface{}) error {
+func (g Grabber) scrapeStruct(doc *goquery.Document, nested any) error {
 	// Parse the struct.
 	tags := parseStruct(nested)
 
@@ -307,7 +307,7 @@ func (g Grabber) scrapeStruct(doc *goquery.Document, nested interface{}) error {
 	return nil
 }
 
-// NewGrab returns a new Grab struct with default values.
+// New returns a new Grab struct with default values.
 func New() *Grabber {
 	return &Grabber{
 		Timeout:      10,
