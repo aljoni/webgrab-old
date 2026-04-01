@@ -95,6 +95,7 @@ You can also register custom converters per `Grabber`. See [docs/WIKI.md](docs/W
 - `BeforeRequest` and `AfterResponse` hooks
 - allowed non-200 status codes
 - retry configuration
+- optional `robots.txt` enforcement for `Grab`
 - `StrictMode` for slices of structs
 
 See [docs/WIKI.md](docs/WIKI.md#http-behavior-hooks-and-retries) and [docs/WIKI.md](docs/WIKI.md#strict-mode) for details.

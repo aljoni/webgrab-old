@@ -540,3 +540,123 @@ func TestGrabRejectsHTMLAndAttrTogether(t *testing.T) {
 		t.Fatalf("expected html/attr conflict, got %v", err)
 	}
 }
+
+func TestGrabRespectsRobotsTxtWhenEnabled(t *testing.T) {
+	var robotsHits int32
+	var pageHits int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			atomic.AddInt32(&robotsHits, 1)
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+		case "/private":
+			atomic.AddInt32(&pageHits, 1)
+			_, _ = w.Write([]byte(`<html><head><title>Hidden</title></head></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	grabber := New()
+	grabber.RespectRobotsTxt = true
+
+	var data struct {
+		Title string `grab:"title"`
+	}
+
+	err := grabber.Grab(server.URL+"/private", &data)
+	if err == nil {
+		t.Fatal("expected robots.txt block")
+	}
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("expected RequestError, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "robots.txt") {
+		t.Fatalf("expected robots.txt error, got %v", err)
+	}
+	if robotsHits != 1 {
+		t.Fatalf("expected one robots.txt request, got %d", robotsHits)
+	}
+	if pageHits != 0 {
+		t.Fatalf("expected blocked page not to be fetched, got %d page hits", pageHits)
+	}
+}
+
+func TestGrabIgnoresRobotsTxtWhenDisabled(t *testing.T) {
+	var robotsHits int32
+	var pageHits int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			atomic.AddInt32(&robotsHits, 1)
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+		case "/private":
+			atomic.AddInt32(&pageHits, 1)
+			_, _ = w.Write([]byte(`<html><head><title>Visible</title></head></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	grabber := New()
+
+	var data struct {
+		Title string `grab:"title"`
+	}
+
+	if err := grabber.Grab(server.URL+"/private", &data); err != nil {
+		t.Fatalf("expected scrape without robots enforcement, got %v", err)
+	}
+	if data.Title != "Visible" {
+		t.Fatalf("expected title %q, got %q", "Visible", data.Title)
+	}
+	if robotsHits != 0 {
+		t.Fatalf("expected robots.txt not to be fetched, got %d hits", robotsHits)
+	}
+	if pageHits != 1 {
+		t.Fatalf("expected one page fetch, got %d", pageHits)
+	}
+}
+
+func TestGrabCachesRobotsTxtByOrigin(t *testing.T) {
+	var robotsHits int32
+	var pageHits int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			atomic.AddInt32(&robotsHits, 1)
+			_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+		case "/one", "/two":
+			atomic.AddInt32(&pageHits, 1)
+			_, _ = w.Write([]byte(`<html><head><title>OK</title></head></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	grabber := New()
+	grabber.RespectRobotsTxt = true
+
+	for _, path := range []string{"/one", "/two"} {
+		var data struct {
+			Title string `grab:"title"`
+		}
+		if err := grabber.Grab(server.URL+path, &data); err != nil {
+			t.Fatalf("grab %s: %v", path, err)
+		}
+	}
+
+	if robotsHits != 1 {
+		t.Fatalf("expected one cached robots.txt fetch, got %d", robotsHits)
+	}
+	if pageHits != 2 {
+		t.Fatalf("expected two page fetches, got %d", pageHits)
+	}
+}

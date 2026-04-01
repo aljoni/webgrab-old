@@ -105,6 +105,7 @@ type Grabber struct {
 	Timeout            int
 	MaxRedirects       int
 	StrictMode         bool
+	RespectRobotsTxt   bool
 	UserAgent          string
 	HTTPClient         *http.Client
 	BeforeRequest      func(*http.Request) error
@@ -120,6 +121,16 @@ type Grabber struct {
 type grabberState struct {
 	mu         sync.RWMutex
 	converters map[reflect.Type]ConverterFunc
+	robots     map[string]*robotsPolicy
+}
+
+type robotsPolicy struct {
+	groups map[string][]robotsRule
+}
+
+type robotsRule struct {
+	pattern string
+	allow   bool
 }
 
 type compiledSchema struct {
@@ -170,6 +181,7 @@ func (g *Grabber) ensureState() *grabberState {
 	if g.state == nil {
 		g.state = &grabberState{
 			converters: make(map[reflect.Type]ConverterFunc),
+			robots:     make(map[string]*robotsPolicy),
 		}
 	}
 	return g.state
@@ -282,6 +294,13 @@ func (g *Grabber) scrapeStruct(doc *goquery.Document, nested any) error {
 
 func (g *Grabber) fetchDocument(rawURL string) (*url.URL, *goquery.Document, error) {
 	client := g.httpClient()
+
+	if g != nil && g.RespectRobotsTxt {
+		if err := g.checkRobotsPolicy(client, rawURL); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	retries := g.retryCount()
 
 	for attempt := 0; attempt <= retries; attempt++ {
@@ -870,6 +889,272 @@ func (g *Grabber) sleepBeforeRetry(attempt int) {
 	time.Sleep(time.Duration(delay))
 }
 
+func (g *Grabber) checkRobotsPolicy(client *http.Client, rawURL string) error {
+	targetURL, err := url.Parse(rawURL)
+	if err != nil {
+		return &RequestError{URL: rawURL, Cause: err}
+	}
+	if targetURL.Scheme == "" || targetURL.Host == "" {
+		return &RequestError{URL: rawURL, Cause: fmt.Errorf("robots.txt checks require an absolute URL")}
+	}
+
+	origin := targetURL.Scheme + "://" + targetURL.Host
+	policy, err := g.robotsPolicy(client, origin)
+	if err != nil {
+		return err
+	}
+	if policy == nil {
+		return nil
+	}
+
+	if !policy.allowed(g.robotsAgent(), robotsTargetPath(targetURL)) {
+		return &RequestError{
+			URL:   rawURL,
+			Cause: fmt.Errorf("blocked by robots.txt"),
+		}
+	}
+	return nil
+}
+
+func (g *Grabber) robotsPolicy(client *http.Client, origin string) (*robotsPolicy, error) {
+	state := g.ensureState()
+
+	state.mu.RLock()
+	cached, ok := state.robots[origin]
+	state.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
+	req, err := http.NewRequest(http.MethodGet, origin+"/robots.txt", nil)
+	if err != nil {
+		return nil, &RequestError{URL: origin + "/robots.txt", Cause: err}
+	}
+	if userAgent := g.userAgent(); userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, &RequestError{URL: origin + "/robots.txt", Cause: err}
+	}
+	defer resp.Body.Close()
+
+	policy, err := parseRobotsResponse(resp)
+	if err != nil {
+		return nil, &RequestError{URL: origin + "/robots.txt", Cause: err}
+	}
+
+	state.mu.Lock()
+	if existing, ok := state.robots[origin]; ok {
+		state.mu.Unlock()
+		return existing, nil
+	}
+	state.robots[origin] = policy
+	state.mu.Unlock()
+
+	return policy, nil
+}
+
+func parseRobotsResponse(resp *http.Response) (*robotsPolicy, error) {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return parseRobotsTxt(string(body)), nil
+	case http.StatusNotFound, http.StatusGone:
+		return nil, nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return &robotsPolicy{
+			groups: map[string][]robotsRule{
+				"*": {{pattern: "/", allow: false}},
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("robots.txt returned status %d", resp.StatusCode)
+	}
+}
+
+func parseRobotsTxt(content string) *robotsPolicy {
+	policy := &robotsPolicy{
+		groups: make(map[string][]robotsRule),
+	}
+
+	var currentAgents []string
+	hadRule := false
+
+	for _, rawLine := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(stripRobotsComment(rawLine))
+		if line == "" {
+			currentAgents = nil
+			hadRule = false
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.ToLower(strings.TrimSpace(parts[1]))
+
+		switch key {
+		case "user-agent":
+			if hadRule {
+				currentAgents = nil
+				hadRule = false
+			}
+			if value == "" {
+				continue
+			}
+			currentAgents = append(currentAgents, value)
+			if _, ok := policy.groups[value]; !ok {
+				policy.groups[value] = nil
+			}
+		case "allow", "disallow":
+			if len(currentAgents) == 0 {
+				continue
+			}
+			hadRule = true
+			for _, agent := range currentAgents {
+				policy.groups[agent] = append(policy.groups[agent], robotsRule{
+					pattern: value,
+					allow:   key == "allow",
+				})
+			}
+		}
+	}
+
+	return policy
+}
+
+func stripRobotsComment(line string) string {
+	if idx := strings.Index(line, "#"); idx >= 0 {
+		return line[:idx]
+	}
+	return line
+}
+
+func (p *robotsPolicy) allowed(agent, target string) bool {
+	if p == nil {
+		return true
+	}
+
+	rules := p.rulesForAgent(strings.ToLower(agent))
+	if len(rules) == 0 {
+		return true
+	}
+
+	bestLen := -1
+	bestAllow := true
+	for _, rule := range rules {
+		if rule.pattern == "" && !rule.allow {
+			continue
+		}
+		if !robotsRuleMatches(rule.pattern, target) {
+			continue
+		}
+		length := len(rule.pattern)
+		if length > bestLen || (length == bestLen && rule.allow) {
+			bestLen = length
+			bestAllow = rule.allow
+		}
+	}
+
+	if bestLen == -1 {
+		return true
+	}
+	return bestAllow
+}
+
+func (p *robotsPolicy) rulesForAgent(agent string) []robotsRule {
+	bestAgent := ""
+	var rules []robotsRule
+	for candidate, candidateRules := range p.groups {
+		if candidate == "*" {
+			if bestAgent == "" {
+				bestAgent = candidate
+				rules = candidateRules
+			}
+			continue
+		}
+		if strings.HasPrefix(agent, candidate) && len(candidate) > len(bestAgent) {
+			bestAgent = candidate
+			rules = candidateRules
+		}
+	}
+	return rules
+}
+
+func robotsRuleMatches(pattern, target string) bool {
+	if pattern == "" {
+		return true
+	}
+
+	endAnchored := strings.HasSuffix(pattern, "$")
+	if endAnchored {
+		pattern = strings.TrimSuffix(pattern, "$")
+	}
+
+	parts := strings.Split(pattern, "*")
+	position := 0
+	startAnchored := !strings.HasPrefix(pattern, "*")
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		index := strings.Index(target[position:], part)
+		if index < 0 {
+			return false
+		}
+		if i == 0 && startAnchored && position+index != 0 {
+			return false
+		}
+		position += index + len(part)
+	}
+
+	if endAnchored && !strings.HasSuffix(target, strings.TrimSuffix(pattern, "*")) {
+		last := parts[len(parts)-1]
+		return last == "" || strings.HasSuffix(target, last)
+	}
+
+	return true
+}
+
+func robotsTargetPath(u *url.URL) string {
+	target := u.EscapedPath()
+	if target == "" {
+		target = "/"
+	}
+	if u.RawQuery != "" {
+		target += "?" + u.RawQuery
+	}
+	return target
+}
+
+func (g *Grabber) robotsAgent() string {
+	userAgent := strings.ToLower(g.userAgent())
+	if strings.Contains(userAgent, "webgrab") {
+		return "webgrab"
+	}
+
+	for _, token := range strings.Fields(userAgent) {
+		product := token
+		if slash := strings.Index(product, "/"); slash >= 0 {
+			product = product[:slash]
+		}
+		product = strings.Trim(product, "();")
+		if product != "" {
+			return product
+		}
+	}
+
+	return "*"
+}
+
 func parseBaseURL(raw string) (*url.URL, error) {
 	if raw == "" {
 		return nil, nil
@@ -1061,6 +1346,7 @@ func New() *Grabber {
 		RetryBackoff: 1.0,
 		state: &grabberState{
 			converters: make(map[reflect.Type]ConverterFunc),
+			robots:     make(map[string]*robotsPolicy),
 		},
 	}
 }

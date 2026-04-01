@@ -618,6 +618,28 @@ grabber.AfterResponse = func(resp *http.Response) error {
 grabber.AllowedStatusCodes = []int{200, 202}
 ```
 
+### Respecting `robots.txt`
+
+```go
+grabber.RespectRobotsTxt = true
+```
+
+When enabled, WebGrab fetches `/robots.txt` for the target origin before
+performing a `Grab` request.
+
+Behavior:
+
+- it applies to `Grab`
+- it does not apply to `GrabReader` or `GrabDocument`
+- the parsed policy is cached per origin inside the `Grabber`
+- disallowed paths are blocked before the page fetch happens
+
+If `robots.txt` returns:
+
+- `200`: WebGrab parses and enforces the rules
+- `404` or `410`: WebGrab treats that as no robots policy
+- `401` or `403`: WebGrab treats that as disallow all
+
 ### Retries
 
 ```go
