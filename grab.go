@@ -25,6 +25,7 @@ const (
 type Grabber struct {
 	Timeout      int
 	MaxRedirects int
+	StrictMode   bool
 	UserAgent    string
 }
 
@@ -249,7 +250,9 @@ func (g Grabber) scrapeStruct(doc *goquery.Document, nested any) error {
 					elemPtr := reflect.New(elemType)
 					subDoc := goquery.NewDocumentFromNode(s.Nodes[0])
 					if err := g.scrapeStruct(subDoc, elemPtr.Interface()); err != nil {
-						itemErrs = append(itemErrs, fmt.Errorf("%s[%d] within %q: %w", tag.Field, i, contextSelector, err))
+						if g.StrictMode {
+							itemErrs = append(itemErrs, fmt.Errorf("%s[%d] within %q: %w", tag.Field, i, contextSelector, err))
+						}
 						return
 					}
 					slice = reflect.Append(slice, elemPtr.Elem())
@@ -301,6 +304,7 @@ func New() *Grabber {
 	return &Grabber{
 		Timeout:      10,
 		MaxRedirects: 10,
+		StrictMode:   false,
 		UserAgent:    "Mozilla/5.0 (compatible; WebGrab/1.0;) Go",
 	}
 }

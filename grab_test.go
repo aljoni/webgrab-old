@@ -83,7 +83,7 @@ func TestScrapeStructReturnsErrorForUnexportedTaggedField(t *testing.T) {
 	}
 }
 
-func TestScrapeStructReportsSliceItemErrorsWithoutDroppingSuccessesSilently(t *testing.T) {
+func TestScrapeStructSkipsInvalidSliceItemsByDefault(t *testing.T) {
 	type item struct {
 		Title string `grab:".title"`
 	}
@@ -99,6 +99,36 @@ func TestScrapeStructReportsSliceItemErrorsWithoutDroppingSuccessesSilently(t *t
 	var data page
 
 	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+	if len(data.Items) != 1 {
+		t.Fatalf("expected one successful item, got %d", len(data.Items))
+	}
+	if data.Items[0].Title != "One" {
+		t.Fatalf("expected first item title to be %q, got %q", "One", data.Items[0].Title)
+	}
+}
+
+func TestScrapeStructReportsSliceItemErrorsInStrictMode(t *testing.T) {
+	type item struct {
+		Title string `grab:".title"`
+	}
+
+	type page struct {
+		Items []item `context:".item"`
+	}
+
+	doc := docFromHTML(t, `
+		<div class="item"><span class="title">One</span></div>
+		<div class="item"><span class="other">Missing title</span></div>
+	`)
+	var data page
+
+	grabber := New()
+	grabber.StrictMode = true
+
+	err := grabber.scrapeStruct(doc, &data)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

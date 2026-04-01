@@ -37,6 +37,7 @@ func main() {
     grabber := webgrab.New()
     grabber.Timeout = 30
     grabber.MaxRedirects = 10
+    grabber.StrictMode = false
     if err := grabber.Grab("http://example.com", &page); err != nil {
         panic(err)
     }
@@ -56,6 +57,8 @@ The defined tags are:
 * `extract:"regexp"` - A regular expression to extract a value from a string.
 * `filter:"regexp"` - A regular expression to filter the value of a field.
 * `context:"selector"` - Restricts the context for a nested struct or slice of structs.
+
+`Grabber.StrictMode` controls how strictly list items are handled. By default it is `false`, so invalid items in slices of structs are skipped and valid items are still returned. Set it to `true` if you want `Grab` to return an error when any matched item cannot be scraped completely.
 
 The selector is a [GoQuery](http://godoc.org/github.com/PuerkitoBio/goquery) selector. The attribute is an
 optional attribute of the selected element to grab. If no attribute is
