@@ -1,6 +1,7 @@
 package webgrab
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -180,5 +181,147 @@ func TestScrapeStructReturnsInvalidExtractRegexErrors(t *testing.T) {
 	}
 	if data.Title != "" {
 		t.Fatalf("expected title to remain empty, got %q", data.Title)
+	}
+}
+
+func TestScrapeStructHandlesListMarkupWithOmittedClosingTags(t *testing.T) {
+	type page struct {
+		Items []string `grab:"li"`
+	}
+
+	doc := docFromHTML(t, `<ul><li>One<li>Two<li>Three</ul>`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	want := []string{"One", "Two", "Three"}
+	if !reflect.DeepEqual(data.Items, want) {
+		t.Fatalf("expected items %v, got %v", want, data.Items)
+	}
+}
+
+func TestScrapeStructHandlesTableMarkupWithMissingRowAndCellClosures(t *testing.T) {
+	type row struct {
+		Title string `grab:".title"`
+		Price string `grab:".price"`
+	}
+
+	type page struct {
+		Rows []row `context:"tr"`
+	}
+
+	doc := docFromHTML(t, `
+		<table>
+			<tr><td class=title>One<td class=price>$10
+			<tr><td class=title>Two<td class=price>$20
+		</table>
+	`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	want := []row{
+		{Title: "One", Price: "$10"},
+		{Title: "Two", Price: "$20"},
+	}
+	if !reflect.DeepEqual(data.Rows, want) {
+		t.Fatalf("expected rows %#v, got %#v", want, data.Rows)
+	}
+}
+
+func TestScrapeStructHandlesHTMLFragmentsWithoutDocumentWrappers(t *testing.T) {
+	type page struct {
+		Headline string   `grab:".headline"`
+		Links    []string `grab:"a[href]" attr:"href"`
+	}
+
+	doc := docFromHTML(t, `<div class=headline>Breaking News</div><a href=/one>One</a><a href=/two>Two</a>`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	if data.Headline != "Breaking News" {
+		t.Fatalf("expected headline %q, got %q", "Breaking News", data.Headline)
+	}
+
+	want := []string{"/one", "/two"}
+	if !reflect.DeepEqual(data.Links, want) {
+		t.Fatalf("expected links %v, got %v", want, data.Links)
+	}
+}
+
+func TestScrapeStructHandlesUppercaseTagsAndUnquotedAttributes(t *testing.T) {
+	type page struct {
+		Headline string   `grab:"h1"`
+		Links    []string `grab:"a[href]" attr:"href"`
+	}
+
+	doc := docFromHTML(t, `<HTML><BODY><H1>News</H1><A HREF=/one>One</A><A HREF=/two>Two</A></BODY></HTML>`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	if data.Headline != "News" {
+		t.Fatalf("expected headline %q, got %q", "News", data.Headline)
+	}
+
+	want := []string{"/one", "/two"}
+	if !reflect.DeepEqual(data.Links, want) {
+		t.Fatalf("expected links %v, got %v", want, data.Links)
+	}
+}
+
+func TestScrapeStructHandlesNestedContextWithOptionalParagraphClosures(t *testing.T) {
+	type profile struct {
+		Name  string `grab:".name"`
+		Email string `grab:".email"`
+	}
+
+	type page struct {
+		Profile profile `context:".profile"`
+	}
+
+	doc := docFromHTML(t, `<div class=profile><p class=name>Alice<p class=email>alice@example.com</div>`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	want := profile{Name: "Alice", Email: "alice@example.com"}
+	if !reflect.DeepEqual(data.Profile, want) {
+		t.Fatalf("expected profile %#v, got %#v", want, data.Profile)
+	}
+}
+
+func TestScrapeStructHandlesAttributeExtractionFromMalformedLinks(t *testing.T) {
+	type page struct {
+		StoryIDs []string `grab:"a[href]" attr:"href" extract:"id=(\\d+)"`
+	}
+
+	doc := docFromHTML(t, `<div><a href=/story?id=42>First<a href=/story?id=314>Second</div>`)
+	var data page
+
+	err := New().scrapeStruct(doc, &data)
+	if err != nil {
+		t.Fatalf("expected no error, got %q", err.Error())
+	}
+
+	want := []string{"42", "314"}
+	if !reflect.DeepEqual(data.StoryIDs, want) {
+		t.Fatalf("expected story ids %v, got %v", want, data.StoryIDs)
 	}
 }

@@ -5,8 +5,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/aljoni/webgrab)](https://goreportcard.com/report/github.com/aljoni/webgrab)
 [![Go Reference](https://pkg.go.dev/badge/github.com/aljoni/webgrab.svg)](https://pkg.go.dev/github.com/aljoni/webgrab)
 
-
-WebGrab is a simple Go library which allows for easy scraping of web pages. It is built on top of the [GoQuery](http://github.com/PuerkitoBio/goquery) library.
+WebGrab is a small Go scraping library built on top of [goquery](http://github.com/PuerkitoBio/goquery). It keeps a tag-based API for simple scraping, while supporting typed conversion, fallback selectors, custom converters, request hooks, retries, and scraping from existing readers or documents.
 
 ## Installation
 
@@ -20,120 +19,133 @@ go get github.com/aljoni/webgrab
 package main
 
 import (
-    "fmt"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
 
-    "github.com/aljoni/webgrab"
+	"github.com/aljoni/webgrab"
 )
 
-type Page struct {
-    Title    string `grab:"title"`
-    Body     string `grab:"body"`
-    Keywords string `grab:"meta[name=keywords]" attr:"content"`
+type Slug struct {
+	Value string
+}
+
+type Post struct {
+	Title     string    `grab:".hero h1||title"`
+	Published time.Time `grab:"time" attr:"datetime"`
+	Keywords  []string  `grab:"meta[name=keywords]" attr:"content" extract:"[^,]+"`
+	Author    string    `grab:".author" optional:"true" default:"Unknown"`
+	URL       string    `grab:"link[rel=canonical]" attr:"href" resolve:"url"`
+	TagLine   string    `grab:".tag" sep:" / "`
+	Slug      Slug      `grab:"meta[name=slug]" attr:"content"`
 }
 
 func main() {
-    page := Page{}
-    
-    grabber := webgrab.New()
-    grabber.Timeout = 30
-    grabber.MaxRedirects = 10
-    grabber.StrictMode = false
-    if err := grabber.Grab("http://example.com", &page); err != nil {
-        panic(err)
-    }
+	grabber := webgrab.New()
+	grabber.Timeout = 30
+	grabber.MaxRedirects = 10
+	grabber.StrictMode = false
+	grabber.RegisterConverter(reflect.TypeOf(Slug{}), func(raw string) (any, error) {
+		return Slug{Value: strings.ToUpper(raw)}, nil
+	})
 
-    fmt.Println(page.Title)
-    fmt.Println(page.Body)
-    fmt.Println(page.Keywords)
+	post := Post{}
+	if err := grabber.Grab("https://example.com/post", &post); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(post.Title)
+	fmt.Println(post.Published)
+	fmt.Println(post.Keywords)
+	fmt.Println(post.Author)
+	fmt.Println(post.URL)
+	fmt.Println(post.TagLine)
+	fmt.Println(post.Slug.Value)
 }
 ```
 
-### Tag Syntax
+## Tag Syntax
 
-The defined tags are:
+Supported tags:
 
-* `grab:"selector"` - The selector to use to grab the value.
-* `attr:"attribute"` - The attribute of the selected element to grab.
-* `extract:"regexp"` - A regular expression to extract a value from a string.
-* `filter:"regexp"` - A regular expression to filter the value of a field.
-* `context:"selector"` - Restricts the context for a nested struct or slice of structs.
+- `grab:"selector"`: CSS selector to scrape. Use `||` for ordered fallbacks, for example `grab:".headline||h1||title"`.
+- `attr:"attribute"`: Extract an attribute instead of text.
+- `extract:"regexp"`: Extract the first capture group from the scraped value.
+- `filter:"regexp"`: Keep only values that match the regular expression.
+- `context:"selector"`: Restrict scraping to a nested context. For scalar slices, the selector runs once inside each matching context.
+- `optional:"true"`: Leave the field at its zero value when nothing is found.
+- `default:"value"`: Fallback raw value when an optional field has no value.
+- `whitespace:"trim|collapse|preserve"`: Control whitespace normalization. Default is `trim`.
+- `html:"true"`: Extract inner HTML instead of text.
+- `resolve:"url"`: Resolve the extracted value against the page or reader base URL.
+- `layout:"..."`: Time layout for `time.Time` fields and slices. Defaults to `time.RFC3339`.
+- `sep:"..."`: Join multiple matched values into a scalar field.
 
-`Grabber.StrictMode` controls how strictly list items are handled. By default it is `false`, so invalid items in slices of structs are skipped and valid items are still returned. Set it to `true` if you want `Grab` to return an error when any matched item cannot be scraped completely.
+Notes:
 
-The selector is a [GoQuery](http://godoc.org/github.com/PuerkitoBio/goquery) selector. The attribute is an
-optional attribute of the selected element to grab. If no attribute is
-specified, the text of the selected element will be grabbed.
+- `html:"true"` and `attr:"..."` cannot be used together.
+- `default` is only applied when `optional:"true"` is set.
+- Slice fields collect all successfully converted values.
+- Struct slice fields skip broken items by default. Set `Grabber.StrictMode = true` to return item errors instead.
 
----
+## Supported Field Types
 
-### Slices
+Built-in scalar and slice conversion works for:
 
-If the field is a slice, all matching elements will be grabbed. For example,
-to grab all links from a page:
+- `string`
+- `bool`
+- `int`, `int8`, `int16`, `int32`, `int64`
+- `uint`, `uint8`, `uint16`, `uint32`, `uint64`
+- `float32`, `float64`
+- `time.Time`
+
+Nested structs and slices of structs are also supported.
+
+For custom destination types, register an exact-type converter on a `Grabber`:
 
 ```go
-type Page struct {
-    Links []string `grab:"a[href]" attr:"href"`
+type Slug struct {
+	Value string
 }
+
+grabber.RegisterConverter(reflect.TypeOf(Slug{}), func(raw string) (any, error) {
+	return Slug{Value: strings.ToUpper(raw)}, nil
+})
 ```
 
----
+## Grab From Existing HTML
 
-### Nested Structs and Context Windows
-
-You can use nested structs to grab values from a specific section of the page.  
-With the new `context` tag, you can restrict the scraping context for a struct or a slice of structs.
-
-#### Single Nested Struct with Context
+You can scrape from a reader or an existing `goquery.Document` without making an HTTP request:
 
 ```go
-type Profile struct {
-    Name  string `grab:".name"`
-    Email string `grab:".email"`
+html := strings.NewReader(`<article><h1>Hello</h1></article>`)
+
+var page struct {
+	Title string `grab:"h1"`
 }
 
-type Page struct {
-    Profile Profile `context:".profile-section"`
-}
-```
-This will only search for `.name` and `.email` inside the first `.profile-section` element.
-
-#### Slice of Structs with Context
-
-```go
-type Item struct {
-    Title string `grab:".title"`
-    Link  string `grab:"a" attr:"href"`
-}
-
-type Page struct {
-    Items []Item `context:".item"`
-}
-```
-This will find all elements matching `.item`, and for each, scrape the `.title` and the first `<a>`'s `href` inside that `.item`.
-
----
-
-### Extract
-
-The `extract` tag can be used to extract a value from a string using a regular
-expression. For example, to extract the title from a Wikipedia page:
-
-```go
-type Page struct {
-    Title string `grab:"title" extract:"(.+) - Wikipedia"`
+if err := grabber.GrabReader("https://example.com/post", html, &page); err != nil {
+	panic(err)
 }
 ```
 
----
+## Request Control
 
-### Filter
+`Grabber` supports custom request behavior:
 
-The `filter` tag can be used to filter the value of a field. For example, to
-get all links that end with `.html`:
+- `HTTPClient`: Use your own `*http.Client`.
+- `BeforeRequest`: Mutate or validate the request before every attempt.
+- `AfterResponse`: Inspect or reject responses before status handling.
+- `AllowedStatusCodes`: Accept non-200 responses.
+- `RetryCount`, `RetryDelay`, `RetryBackoff`: Retry transient request failures and status codes `429`, `502`, `503`, and `504`.
 
-```go
-type Page struct {
-    Links []string `grab:"a[href]" attr:"href" filter:".*\\.html$"`
-}
-```
+## Errors
+
+WebGrab exposes typed errors:
+
+- `FieldError`: Selector, conversion, or field-configuration failures.
+- `StatusError`: Disallowed HTTP status codes.
+- `RequestError`: Request setup, hook, or transport failures.
+
+These are returned directly or as part of `errors.Join`, so `errors.As` works for structured handling.
