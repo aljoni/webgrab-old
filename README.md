@@ -37,7 +37,9 @@ func main() {
     grabber := webgrab.New()
     grabber.Timeout = 30
     grabber.MaxRedirects = 10
-    grabber.Grab("http://example.com", &page)
+    if err := grabber.Grab("http://example.com", &page); err != nil {
+        panic(err)
+    }
 
     fmt.Println(page.Title)
     fmt.Println(page.Body)
@@ -61,9 +63,9 @@ specified, the text of the selected element will be grabbed.
 
 ---
 
-### Arrays
+### Slices
 
-If the field is an array, all matching elements will be grabbed. For example,
+If the field is a slice, all matching elements will be grabbed. For example,
 to grab all links from a page:
 
 ```go
