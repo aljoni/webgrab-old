@@ -7,7 +7,7 @@
 
 WebGrab is a small Go scraping library built on top of [goquery](http://github.com/PuerkitoBio/goquery).
 
-It gives you a simple struct-tag API for:
+It provides a simple struct-tag API for:
 
 - scraping from URLs, readers, or existing `goquery` documents
 - extracting text, HTML, or attributes
@@ -66,7 +66,7 @@ func main() {
 - `layout:"..."`: time parsing layout for `time.Time`.
 - `sep:"..."`: join multiple matches into one scalar field.
 
-More tags and behavior notes are documented in [docs/WIKI.md](docs/WIKI.md).
+More tags and behavior notes are covered in [docs/WIKI.md](docs/WIKI.md).
 
 ## Supported Types
 
@@ -79,7 +79,7 @@ Built-in support includes:
 - slices of the supported scalar types
 - nested structs and slices of structs
 
-You can also register custom converters per `Grabber`. See [docs/WIKI.md](docs/WIKI.md#custom-type-converters).
+You can also register custom converters per `Grabber`. See the [custom type converters](docs/WIKI.md#custom-type-converters) section in the wiki.
 
 ## Entry Points
 
@@ -98,7 +98,7 @@ You can also register custom converters per `Grabber`. See [docs/WIKI.md](docs/W
 - optional `robots.txt` enforcement for `Grab`
 - `StrictMode` for slices of structs
 
-See [docs/WIKI.md](docs/WIKI.md#http-behavior-hooks-and-retries) and [docs/WIKI.md](docs/WIKI.md#strict-mode) for details.
+See the wiki sections on [HTTP behavior, hooks, and retries](docs/WIKI.md#http-behavior-hooks-and-retries) and [strict mode](docs/WIKI.md#strict-mode) for details.
 
 ## Errors
 
@@ -108,4 +108,4 @@ WebGrab exposes typed errors:
 - `StatusError`
 - `RequestError`
 
-See [docs/WIKI.md](docs/WIKI.md#errors) for examples with `errors.As`.
+See the [errors](docs/WIKI.md#errors) section in the wiki for examples with `errors.As`.

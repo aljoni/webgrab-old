@@ -304,19 +304,9 @@ func (g *Grabber) fetchDocument(rawURL string) (*url.URL, *goquery.Document, err
 	retries := g.retryCount()
 
 	for attempt := 0; attempt <= retries; attempt++ {
-		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		req, err := g.newFetchRequest(rawURL)
 		if err != nil {
-			return nil, nil, &RequestError{URL: rawURL, Cause: err}
-		}
-
-		if userAgent := g.userAgent(); userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-		}
-
-		if g.BeforeRequest != nil {
-			if err := g.BeforeRequest(req); err != nil {
-				return nil, nil, &RequestError{URL: rawURL, Cause: err}
-			}
+			return nil, nil, err
 		}
 
 		resp, err := client.Do(req)
@@ -328,42 +318,96 @@ func (g *Grabber) fetchDocument(rawURL string) (*url.URL, *goquery.Document, err
 			return nil, nil, &RequestError{URL: rawURL, Cause: err}
 		}
 
-		finalURL := rawURL
-		if resp.Request != nil && resp.Request.URL != nil {
-			finalURL = resp.Request.URL.String()
+		parsedURL, doc, retry, err := g.handleFetchResponse(resp, attempt, retries)
+		if retry {
+			continue
 		}
-
-		if g.AfterResponse != nil {
-			if err := g.AfterResponse(resp); err != nil {
-				resp.Body.Close()
-				return nil, nil, &RequestError{URL: finalURL, Cause: err}
-			}
-		}
-
-		if !g.isAllowedStatus(resp.StatusCode) {
-			if attempt < retries && isRetryableStatus(resp.StatusCode) {
-				resp.Body.Close()
-				g.sleepBeforeRetry(attempt)
-				continue
-			}
-			resp.Body.Close()
-			return nil, nil, &StatusError{URL: finalURL, StatusCode: resp.StatusCode}
-		}
-
-		doc, err := goquery.NewDocumentFromReader(resp.Body)
-		resp.Body.Close()
 		if err != nil {
 			return nil, nil, err
-		}
-
-		parsedURL, err := url.Parse(finalURL)
-		if err != nil {
-			return nil, nil, &RequestError{URL: finalURL, Cause: err}
 		}
 		return parsedURL, doc, nil
 	}
 
 	return nil, nil, &RequestError{URL: rawURL, Cause: fmt.Errorf("request retries exhausted")}
+}
+
+func (g *Grabber) newFetchRequest(rawURL string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, &RequestError{URL: rawURL, Cause: err}
+	}
+
+	if userAgent := g.userAgent(); userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+
+	if g.BeforeRequest != nil {
+		if err := g.BeforeRequest(req); err != nil {
+			return nil, &RequestError{URL: rawURL, Cause: err}
+		}
+	}
+
+	return req, nil
+}
+
+func (g *Grabber) handleFetchResponse(resp *http.Response, attempt, retries int) (*url.URL, *goquery.Document, bool, error) {
+	finalURL := responseURL(resp)
+
+	if err := g.runAfterResponse(resp, finalURL); err != nil {
+		return nil, nil, false, err
+	}
+
+	if retry := g.retryStatusResponse(resp, finalURL, attempt, retries); retry {
+		return nil, nil, true, nil
+	}
+
+	if !g.isAllowedStatus(resp.StatusCode) {
+		resp.Body.Close()
+		return nil, nil, false, &StatusError{URL: finalURL, StatusCode: resp.StatusCode}
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	parsedURL, err := url.Parse(finalURL)
+	if err != nil {
+		return nil, nil, false, &RequestError{URL: finalURL, Cause: err}
+	}
+
+	return parsedURL, doc, false, nil
+}
+
+func responseURL(resp *http.Response) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return ""
+}
+
+func (g *Grabber) runAfterResponse(resp *http.Response, finalURL string) error {
+	if g.AfterResponse == nil {
+		return nil
+	}
+	if err := g.AfterResponse(resp); err != nil {
+		resp.Body.Close()
+		return &RequestError{URL: finalURL, Cause: err}
+	}
+	return nil
+}
+
+func (g *Grabber) retryStatusResponse(resp *http.Response, finalURL string, attempt, retries int) bool {
+	if g.isAllowedStatus(resp.StatusCode) {
+		return false
+	}
+	if attempt >= retries || !isRetryableStatus(resp.StatusCode) {
+		return false
+	}
+	resp.Body.Close()
+	g.sleepBeforeRetry(attempt)
+	return true
 }
 
 func (g *Grabber) scrapeSelection(baseURL *url.URL, root *goquery.Selection, data any, path string) error {
@@ -447,29 +491,51 @@ func (g *Grabber) applyNestedStructField(baseURL *url.URL, root *goquery.Selecti
 }
 
 func (g *Grabber) applyStructSliceField(baseURL *url.URL, root *goquery.Selection, value reflect.Value, field compiledField, path string) error {
+	contexts, err := g.structSliceContexts(root, field, path)
+	if err != nil || contexts == nil {
+		return err
+	}
+
+	slice := reflect.MakeSlice(value.Type(), 0, contexts.Length())
+	errs := g.collectStructSliceItems(baseURL, contexts, value.Type().Elem(), path, &slice)
+
+	value.Set(slice)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+func (g *Grabber) structSliceContexts(root *goquery.Selection, field compiledField, path string) (*goquery.Selection, error) {
 	if field.context == "" {
 		if field.optional {
-			return nil
+			return nil, nil
 		}
-		return wrapFieldError(path, field, fmt.Errorf("slice of structs requires a context tag"))
+		return nil, wrapFieldError(path, field, fmt.Errorf("slice of structs requires a context tag"))
 	}
-	if field.usesScalarExtraction() && (len(field.selectors) > 0 || field.attribute != "" || field.extract != nil || field.filter != nil || field.html || field.resolve != "" || field.layout != "" || field.separator != "" || field.defaultValue != "") {
-		return wrapFieldError(path, field, fmt.Errorf("slice of structs only supports context and optional tags"))
+	if field.usesStructSliceScalarTags() {
+		return nil, wrapFieldError(path, field, fmt.Errorf("slice of structs only supports context and optional tags"))
 	}
 
 	contexts := root.Find(field.context)
 	if contexts.Length() == 0 {
 		if field.optional {
-			return nil
+			return nil, nil
 		}
-		return wrapFieldError(path, field, fmt.Errorf("context not found"))
+		return nil, wrapFieldError(path, field, fmt.Errorf("context not found"))
 	}
 
-	slice := reflect.MakeSlice(value.Type(), 0, contexts.Length())
-	var errs []error
+	return contexts, nil
+}
 
+func (f compiledField) usesStructSliceScalarTags() bool {
+	return len(f.selectors) > 0 || f.attribute != "" || f.extract != nil || f.filter != nil || f.html || f.resolve != "" || f.layout != "" || f.separator != "" || f.defaultValue != ""
+}
+
+func (g *Grabber) collectStructSliceItems(baseURL *url.URL, contexts *goquery.Selection, elemType reflect.Type, path string, slice *reflect.Value) []error {
+	var errs []error
 	contexts.Each(func(i int, ctx *goquery.Selection) {
-		elemPtr := reflect.New(value.Type().Elem())
+		elemPtr := reflect.New(elemType)
 		itemPath := fmt.Sprintf("%s[%d]", path, i)
 		if err := g.scrapeSelection(baseURL, ctx, elemPtr.Interface(), itemPath); err != nil {
 			if g.StrictMode {
@@ -477,14 +543,9 @@ func (g *Grabber) applyStructSliceField(baseURL *url.URL, root *goquery.Selectio
 			}
 			return
 		}
-		slice = reflect.Append(slice, elemPtr.Elem())
+		*slice = reflect.Append(*slice, elemPtr.Elem())
 	})
-
-	value.Set(slice)
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
+	return errs
 }
 
 func (g *Grabber) applyScalarField(baseURL *url.URL, root *goquery.Selection, value reflect.Value, field compiledField, path string) error {
@@ -714,75 +775,102 @@ func normalizeWhitespace(raw, mode string) string {
 
 func (g *Grabber) convertValue(raw string, target reflect.Type, field compiledField) (reflect.Value, error) {
 	if converter, ok := g.lookupConverter(target); ok {
-		converted, err := converter(raw)
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		value := reflect.ValueOf(converted)
-		if !value.IsValid() {
-			return reflect.Value{}, fmt.Errorf("converter returned nil")
-		}
-		if value.Type().AssignableTo(target) {
-			return value, nil
-		}
-		if value.Type().ConvertibleTo(target) {
-			return value.Convert(target), nil
-		}
-		return reflect.Value{}, fmt.Errorf("converter returned %s, cannot assign to %s", value.Type(), target)
+		return convertCustomValue(converter, raw, target)
 	}
 
 	if target == timeType {
-		layout := field.layout
-		if layout == "" {
-			layout = time.RFC3339
-		}
-		parsed, err := time.Parse(layout, raw)
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		return reflect.ValueOf(parsed), nil
+		return convertTimeValue(raw, field.layout)
 	}
 
 	switch target.Kind() {
 	case reflect.String:
-		value := reflect.New(target).Elem()
-		value.SetString(raw)
-		return value, nil
+		return setStringValue(target, raw), nil
 	case reflect.Bool:
-		parsed, err := strconv.ParseBool(raw)
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		value := reflect.New(target).Elem()
-		value.SetBool(parsed)
-		return value, nil
+		return convertBoolValue(target, raw)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		parsed, err := strconv.ParseInt(raw, 10, target.Bits())
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		value := reflect.New(target).Elem()
-		value.SetInt(parsed)
-		return value, nil
+		return convertIntValue(target, raw)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		parsed, err := strconv.ParseUint(raw, 10, target.Bits())
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		value := reflect.New(target).Elem()
-		value.SetUint(parsed)
-		return value, nil
+		return convertUintValue(target, raw)
 	case reflect.Float32, reflect.Float64:
-		parsed, err := strconv.ParseFloat(raw, target.Bits())
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		value := reflect.New(target).Elem()
-		value.SetFloat(parsed)
-		return value, nil
+		return convertFloatValue(target, raw)
 	default:
 		return reflect.Value{}, fmt.Errorf("unsupported field type %s", target)
 	}
+}
+
+func convertCustomValue(converter ConverterFunc, raw string, target reflect.Type) (reflect.Value, error) {
+	converted, err := converter(raw)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	value := reflect.ValueOf(converted)
+	if !value.IsValid() {
+		return reflect.Value{}, fmt.Errorf("converter returned nil")
+	}
+	if value.Type().AssignableTo(target) {
+		return value, nil
+	}
+	if value.Type().ConvertibleTo(target) {
+		return value.Convert(target), nil
+	}
+	return reflect.Value{}, fmt.Errorf("converter returned %s, cannot assign to %s", value.Type(), target)
+}
+
+func convertTimeValue(raw, layout string) (reflect.Value, error) {
+	if layout == "" {
+		layout = time.RFC3339
+	}
+	parsed, err := time.Parse(layout, raw)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	return reflect.ValueOf(parsed), nil
+}
+
+func setStringValue(target reflect.Type, raw string) reflect.Value {
+	value := reflect.New(target).Elem()
+	value.SetString(raw)
+	return value
+}
+
+func convertBoolValue(target reflect.Type, raw string) (reflect.Value, error) {
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	value := reflect.New(target).Elem()
+	value.SetBool(parsed)
+	return value, nil
+}
+
+func convertIntValue(target reflect.Type, raw string) (reflect.Value, error) {
+	parsed, err := strconv.ParseInt(raw, 10, target.Bits())
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	value := reflect.New(target).Elem()
+	value.SetInt(parsed)
+	return value, nil
+}
+
+func convertUintValue(target reflect.Type, raw string) (reflect.Value, error) {
+	parsed, err := strconv.ParseUint(raw, 10, target.Bits())
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	value := reflect.New(target).Elem()
+	value.SetUint(parsed)
+	return value, nil
+}
+
+func convertFloatValue(target reflect.Type, raw string) (reflect.Value, error) {
+	parsed, err := strconv.ParseFloat(raw, target.Bits())
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	value := reflect.New(target).Elem()
+	value.SetFloat(parsed)
+	return value, nil
 }
 
 func (g *Grabber) isNestedStructField(target reflect.Type) bool {
@@ -1219,101 +1307,136 @@ func compileSchema(target reflect.Type) *compiledSchema {
 	}
 
 	for i := 0; i < target.NumField(); i++ {
-		structField := target.Field(i)
-		field := compiledField{
-			name:         structField.Name,
-			index:        i,
-			fieldType:    structField.Type,
-			context:      strings.TrimSpace(structField.Tag.Get(tagNameContext)),
-			attribute:    strings.TrimSpace(structField.Tag.Get(tagNameAttribute)),
-			defaultValue: structField.Tag.Get(tagNameDefault),
-			resolve:      strings.TrimSpace(structField.Tag.Get(tagNameResolve)),
-			layout:       structField.Tag.Get(tagNameLayout),
-			separator:    structField.Tag.Get(tagNameSeparator),
-			whitespace:   whitespaceTrim,
-		}
-
-		rawSelector := structField.Tag.Get(tagNameGrab)
-		if rawSelector != "" {
-			field.selectors = parseSelectorFallbacks(rawSelector)
-		}
-
-		field.configured = rawSelector != "" ||
-			structField.Tag.Get(tagNameExtract) != "" ||
-			structField.Tag.Get(tagNameFilter) != "" ||
-			field.attribute != "" ||
-			field.context != "" ||
-			structField.Tag.Get(tagNameOptional) != "" ||
-			structField.Tag.Get(tagNameDefault) != "" ||
-			structField.Tag.Get(tagNameWhitespace) != "" ||
-			structField.Tag.Get(tagNameHTML) != "" ||
-			field.resolve != "" ||
-			field.layout != "" ||
-			field.separator != ""
-
-		if rawSelector != "" && len(field.selectors) == 0 {
-			field.compileErr = fmt.Errorf("grab tag must contain at least one selector")
-		}
-
-		if optionalRaw := structField.Tag.Get(tagNameOptional); optionalRaw != "" {
-			optional, err := strconv.ParseBool(optionalRaw)
-			if err != nil {
-				field.compileErr = firstError(field.compileErr, fmt.Errorf("optional tag must be a boolean: %w", err))
-			} else {
-				field.optional = optional
-			}
-		}
-
-		if whitespaceRaw := strings.TrimSpace(structField.Tag.Get(tagNameWhitespace)); whitespaceRaw != "" {
-			switch whitespaceRaw {
-			case whitespaceTrim, whitespaceCollapse, whitespacePreserve:
-				field.whitespace = whitespaceRaw
-			default:
-				field.compileErr = firstError(field.compileErr, fmt.Errorf("invalid whitespace mode %q", whitespaceRaw))
-			}
-		}
-
-		if htmlRaw := structField.Tag.Get(tagNameHTML); htmlRaw != "" {
-			html, err := strconv.ParseBool(htmlRaw)
-			if err != nil {
-				field.compileErr = firstError(field.compileErr, fmt.Errorf("html tag must be a boolean: %w", err))
-			} else {
-				field.html = html
-			}
-		}
-
-		if field.html && field.attribute != "" {
-			field.compileErr = firstError(field.compileErr, fmt.Errorf("html and attr tags cannot be used together"))
-		}
-
-		if field.resolve != "" && field.resolve != "url" {
-			field.compileErr = firstError(field.compileErr, fmt.Errorf("unsupported resolve mode %q", field.resolve))
-		}
-
-		if filterRaw := structField.Tag.Get(tagNameFilter); filterRaw != "" {
-			filter, err := regexp.Compile(filterRaw)
-			if err != nil {
-				field.compileErr = firstError(field.compileErr, fmt.Errorf("invalid filter regex %q: %w", filterRaw, err))
-			} else {
-				field.filter = filter
-				field.filterSource = filterRaw
-			}
-		}
-
-		if extractRaw := structField.Tag.Get(tagNameExtract); extractRaw != "" {
-			extract, err := regexp.Compile(extractRaw)
-			if err != nil {
-				field.compileErr = firstError(field.compileErr, fmt.Errorf("invalid extract regex %q: %w", extractRaw, err))
-			} else {
-				field.extract = extract
-				field.extractSource = extractRaw
-			}
-		}
-
-		schema.fields = append(schema.fields, field)
+		schema.fields = append(schema.fields, compileField(target.Field(i), i))
 	}
 
 	return schema
+}
+
+func compileField(structField reflect.StructField, index int) compiledField {
+	field := baseCompiledField(structField, index)
+	field.selectors = compileFieldSelectors(structField, &field)
+	field.configured = fieldConfigured(structField, field)
+	applyFieldBooleanOptions(structField, &field)
+	applyFieldWhitespace(structField, &field)
+	applyFieldHTML(structField, &field)
+	validateFieldCombinations(&field)
+	compileFieldRegexps(structField, &field)
+	return field
+}
+
+func baseCompiledField(structField reflect.StructField, index int) compiledField {
+	return compiledField{
+		name:         structField.Name,
+		index:        index,
+		fieldType:    structField.Type,
+		context:      strings.TrimSpace(structField.Tag.Get(tagNameContext)),
+		attribute:    strings.TrimSpace(structField.Tag.Get(tagNameAttribute)),
+		defaultValue: structField.Tag.Get(tagNameDefault),
+		resolve:      strings.TrimSpace(structField.Tag.Get(tagNameResolve)),
+		layout:       structField.Tag.Get(tagNameLayout),
+		separator:    structField.Tag.Get(tagNameSeparator),
+		whitespace:   whitespaceTrim,
+	}
+}
+
+func compileFieldSelectors(structField reflect.StructField, field *compiledField) []string {
+	rawSelector := structField.Tag.Get(tagNameGrab)
+	if rawSelector == "" {
+		return nil
+	}
+
+	selectors := parseSelectorFallbacks(rawSelector)
+	if len(selectors) == 0 {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("grab tag must contain at least one selector"))
+	}
+	return selectors
+}
+
+func fieldConfigured(structField reflect.StructField, field compiledField) bool {
+	return structField.Tag.Get(tagNameGrab) != "" ||
+		structField.Tag.Get(tagNameExtract) != "" ||
+		structField.Tag.Get(tagNameFilter) != "" ||
+		field.attribute != "" ||
+		field.context != "" ||
+		structField.Tag.Get(tagNameOptional) != "" ||
+		structField.Tag.Get(tagNameDefault) != "" ||
+		structField.Tag.Get(tagNameWhitespace) != "" ||
+		structField.Tag.Get(tagNameHTML) != "" ||
+		field.resolve != "" ||
+		field.layout != "" ||
+		field.separator != ""
+}
+
+func applyFieldBooleanOptions(structField reflect.StructField, field *compiledField) {
+	optionalRaw := structField.Tag.Get(tagNameOptional)
+	if optionalRaw == "" {
+		return
+	}
+
+	optional, err := strconv.ParseBool(optionalRaw)
+	if err != nil {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("optional tag must be a boolean: %w", err))
+		return
+	}
+	field.optional = optional
+}
+
+func applyFieldWhitespace(structField reflect.StructField, field *compiledField) {
+	whitespaceRaw := strings.TrimSpace(structField.Tag.Get(tagNameWhitespace))
+	if whitespaceRaw == "" {
+		return
+	}
+
+	switch whitespaceRaw {
+	case whitespaceTrim, whitespaceCollapse, whitespacePreserve:
+		field.whitespace = whitespaceRaw
+	default:
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("invalid whitespace mode %q", whitespaceRaw))
+	}
+}
+
+func applyFieldHTML(structField reflect.StructField, field *compiledField) {
+	htmlRaw := structField.Tag.Get(tagNameHTML)
+	if htmlRaw == "" {
+		return
+	}
+
+	html, err := strconv.ParseBool(htmlRaw)
+	if err != nil {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("html tag must be a boolean: %w", err))
+		return
+	}
+	field.html = html
+}
+
+func validateFieldCombinations(field *compiledField) {
+	if field.html && field.attribute != "" {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("html and attr tags cannot be used together"))
+	}
+	if field.resolve != "" && field.resolve != "url" {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("unsupported resolve mode %q", field.resolve))
+	}
+}
+
+func compileFieldRegexps(structField reflect.StructField, field *compiledField) {
+	compileFieldRegexp(structField.Tag.Get(tagNameFilter), "filter", &field.filter, &field.filterSource, field)
+	compileFieldRegexp(structField.Tag.Get(tagNameExtract), "extract", &field.extract, &field.extractSource, field)
+}
+
+func compileFieldRegexp(raw, name string, target **regexp.Regexp, source *string, field *compiledField) {
+	if raw == "" {
+		return
+	}
+
+	compiled, err := regexp.Compile(raw)
+	if err != nil {
+		field.compileErr = firstError(field.compileErr, fmt.Errorf("invalid %s regex %q: %w", name, raw, err))
+		return
+	}
+
+	*target = compiled
+	*source = raw
 }
 
 func parseSelectorFallbacks(raw string) []string {
