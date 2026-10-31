@@ -35,7 +35,7 @@ import (
 
 type Page struct {
 	Title    string   `grab:"h1||title"`
-	Keywords []string `grab:"meta[name=keywords]" attr:"content" extract:"([^,]+)"`
+	Keywords string `grab:"meta[name=keywords]" attr:"content"`
 	Author   string   `grab:".author" optional:"true" default:"Unknown"`
 }
 
